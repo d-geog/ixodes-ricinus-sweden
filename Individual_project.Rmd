@@ -1,0 +1,356 @@
+---
+title: "Individual Project"
+author: "Devika Kuzhupadickal Sreekumar"
+date: "2026-10-11"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+Assess the distribution for the tick 'Ixodes ricinus' in Sweden, produce a map with spatial resolution (*to be decided*) and compare the the predicted distribution for this species with the ECDC map.
+
+**Tasks**
+
+- Model compared to original assessment
+- SDM based on another data set, with another model method and only in Sweden.
+- Characterise uncertainty by model calibration where you change what data that is used (bootstrapping) and propagate to the SDM output.
+- Summarise uncertainty in selected regions on the edge of the distribution
+- Use your assessment to conclude if there is a concern to become get bitten by a tick and become infected with tick-borne encephalitis virus (TBE). Provide your conclusion with an assessment of overall uncertainty, one per country.  
+
+**Approach**
+
+We use species data and habitat suitability data (climate data and land cover information) into a species distribution model(SDM)  
+
+The modelling method is **Maxnet**, an R implementation of maximum entropy modelling. It compares the conditions at recorded locations with conditions available across the study area and it does **not** need confirmed absences.
+
+| Choose this key | Swedish name | Scientific name | Records supplied |
+| --- | --- | --- | ---: |
+| `"common_tick"` | Common tick | *Ixodes Ricinus* | 2275 |
+
+**Mission:**  make the maps, use the habitat suitability data and compare maps
+
+### setting up the libraries
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center", out.width = "90%")
+
+packages <- c("SDMtune", "terra", "sf", "ggplot2", "dplyr")
+missing <- packages[!vapply(packages, requireNamespace, logical(1),
+                            quietly = TRUE)]
+if (length(missing)) {
+  stop("Install these R packages: ", paste(missing, collapse = ", "))
+}
+# install.packages(c("SDMtune", "terra", "sf", "ggplot2", "dplyr"))
+
+library(SDMtune)
+library(terra)
+library(sf)
+library(ggplot2)
+library(dplyr)
+
+set.seed(42)  # Repeatable thinning and background sampling
+```
+
+### Add the species data 
+
+The species data is from artportalen.se from the species Ixodes ricinus for the period 2000 - 2026, around 2275 tick observation have been recorded for Sweden.
+
+```{r}
+# ---- choose-species ----
+species_key <- "common_tick"
+
+species <- list(
+  common_tick = list(file = "Tick_data.csv",
+  common = "Common tick", 
+  latin = "Ixodes ricinus")
+)
+
+stopifnot(species_key %in% names(species))
+tick <- species[[species_key]]
+out_dir <- file.path("results", species_key)
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+tick$latin
+
+```
+
+## 2. Give the model a climate map and land cover map (habitat suitability data)
+
+The habitat suitability data are two kinds of environmental maps: **climate** and **land cover**.
+
+We use just **three** CHELSA variables so that the model and its response curves are easy to explore. They describe mean annual temperature (**BIO1**), annual precipitation (**BIO12**), and precipitation seasonality (**BIO15**). The model can learn curved relationships using linear and quadratic features.
+
+Land cover data comes from CORINE Land Cover (CLC). Sweden is the **study area**. We crop out the neighboring countries so the background points and the final map cover the same area.
+
+```{r NUTS_data_preparation }
+nuts_all <- terra::vect("data/NUTS.gpkg") #Europe wide data 
+
+nuts3_se <- nuts_all[nuts_all$CNTR_CODE == "SE" & nuts_all$LEVL_CODE == 3, ] #Cropping just to Sweden, Level 3 (län) region
+stopifnot(nrow(nuts3_se) == 21) # sweden has 21 NUTS3 regions
+
+terra::writeVector(nuts3_se, "data/Sweden_NUTS3.gpkg", overwrite = TRUE) #Save the cropped Sweden file as GeoPackage
+
+terra::plot(nuts3_se, col = "#A5CCC0", border = "#294851", main = "Sweden NUTS 3 (län)")
+```
+
+```{r landcover_data_preparation}
+landcover <- terra::rast("data/LC_Corine.tif")
+nuts3_se  <- terra::vect("data/Sweden_NUTS3.gpkg")
+
+terra::crs(landcover) <- terra::crs(nuts3_se) # lc and nuts3 data have same cordinate system
+
+lc_sweden <- terra::mask(terra::crop(landcover, nuts3_se), nuts3_se) # cropping the lc data to sweden
+
+terra::writeRaster(lc_sweden, "data/LC_Sweden_cropped.tif",
+                   overwrite = TRUE, datatype = "INT2U") # saving the cropped raster
+
+# Plotting the new files
+terra::plot(lc_sweden, main = "Land cover, Sweden")
+terra::lines(nuts3_se, col = "black")
+
+terra::crs(lc_sweden, describe = TRUE)$name # check: should now say ETRS89-extended / LAEA Europe
+```
+
+```{r input_data}
+inputs <- c("data/climate_sweden.tif",  
+            "data/LC_Sweden_cropped.tif",   
+            "data/Sweden_NUTS3.gpkg",    
+            "data/Tick_data.csv")            
+
+# stop and list the missing files if any are not here
+if (!all(file.exists(inputs))) {
+  stop("Missing input files: ", paste(inputs[!file.exists(inputs)], collapse = ", "))
+}
+```
+
+
+```{r climate}
+climate  <- terra::rast("data/climate_sweden.tif")
+nuts3_se <- terra::vect("data/Sweden_NUTS3.gpkg")
+
+stopifnot(terra::nlyr(climate) == 3)                  # the climate raster must have exactly 3 layers
+names(climate) <- c("bio1", "bio12", "bio15")
+
+nuts3_clim <- terra::vect(
+  sf::st_transform(sf::st_as_sf(nuts3_se), 4326)
+) # the raster is in lon/lat and the regions in metres, so transform the regions to lon/lat (EPSG:4326)
+
+cols <- grDevices::colorRampPalette(
+  c("#143D55", "#287D91", "#A5CCC0", "#F4D392", "#D76346")
+)(100)
+names(climate)
+
+terra::plot(climate[[1]], col = cols, main = "Annual mean temperature")    # map of bio1
+terra::lines(nuts3_clim, col = "#294851", lwd = 0.6)
+
+terra::plot(climate[[2]], col = cols, main = "Total annual precipitation") # map of bio12
+terra::lines(nuts3_clim, col = "#294851", lwd = 0.6)
+
+terra::plot(climate[[3]], col = cols, main = "Precipitation seasonality")  # map of bio15
+terra::lines(nuts3_clim, col = "#294851", lwd = 0.6)
+```
+
+```{r}
+landcover <- terra::rast("data/LC_Sweden_cropped.tif") 
+nuts3_se  <- terra::vect("data/Sweden_NUTS3.gpkg")  
+
+names(landcover) <- "landcover"   
+
+landcover[landcover %in% c(48, 255)] <- NA             # NODATA / unclassified codes become NA (missing)
+terra::freq(landcover)                                 # values 1-44 mean GRID_CODE (the CLC legend codes)
+```
+
+```{r}
+# reclassification table: from, to, becomes
+rcl <- matrix(c(
+   1, 11, 1,   # Artificial surfaces
+  12, 22, 2,   # Agricultural areas
+  23, 34, 3,   # Forest and semi natural areas
+  35, 39, 4,   # Wetlands
+  40, 44, 5    # Water bodies
+), ncol = 3, byrow = TRUE)
+
+# right = NA makes the intervals closed on both sides, so codes 12, 23, 35 and 40 are not lost
+lc_level1 <- terra::classify(landcover, rcl, include.lowest = TRUE, right = NA)
+names(lc_level1) <- "lc_level1"  # new layer                   
+
+levels(lc_level1) <- data.frame(                     
+  id    = 1:5,
+  class = c("Artificial surfaces", "Agricultural areas",
+            "Forest and semi natural", "Wetlands", "Water bodies")
+)
+lc_cols <- c("red", "yellow", "forestgreen", "brown", "blue")   # one colour per class
+
+terra::plot(lc_level1, col = lc_cols, main = "Land cover (CLC level 1)")  # map of the five classes
+terra::lines(nuts3_se, col = "black", lwd = 0.6)                          # region borders on top
+
+terra::freq(lc_level1)                                 # check: exactly 5 classes and no NA row
+```
+```{r}
+# forest and semi natural = CLC level 1 class 3 = GRID_CODE 23 to 34
+# from, to, becomes; right = NA makes the interval closed on both sides, so 23 and 34 are included
+forest_sn <- terra::classify(landcover, rcl = matrix(c(23, 34, 1), ncol = 3),
+                             others = 0, right = NA)   # forest and semi natural = 1, everything else = 0
+names(forest_sn) <- "forest_sn"                        # name the new layer
+
+terra::plot(forest_sn, col = c("white", "forestgreen"),
+            main = "Forest and semi natural (1) vs. other land (0)")   # map of the layer
+terra::lines(nuts3_se, col = "black", lwd = 0.6)                      # region borders on top
+
+terra::freq(forest_sn)                                 # number of cells in each class
+```
+```{r}
+# forest = CLC 311, 312, 313 = GRID_CODE 23, 24, 25 (exact values, so no intervals needed)
+forest <- terra::classify(landcover, rcl = cbind(c(23, 24, 25), 1), others = 0)  # forest = 1, everything else = 0
+names(forest) <- "forest"                              # name the new layer
+
+terra::plot(forest, col = c("white", "forestgreen"), main = "Forest (1) vs. non-forest (0)")  # forest map
+terra::lines(nuts3_se, col = "black", lwd = 0.6)       # region borders on top
+
+terra::freq(forest)                                    # number of forest and non-forest cells
+```
+```{r}
+records <- read.csv(file.path("data", tick$file), skip = 2, sep = ",",
+                    fileEncoding = "latin1") # read the Artportalen file (header starts on line 3)
+
+stopifnot(all(c("Ost", "Nord") %in% names(records)))           # check: coordinate columns exist
+records <- records[complete.cases(records[, c("Ost", "Nord")]), ]   # keep rows that have both coordinates
+
+observations <- sf::st_as_sf(records, coords = c("Ost", "Nord"), crs = 3021)  
+observations <- sf::st_transform(observations, 4326)    
+
+regions <- sf::st_transform(sf::st_read("data/Sweden_NUTS3.gpkg", quiet = TRUE), 4326) # regional map for background
+
+tick_map <- ggplot() +
+  geom_sf(data = regions, fill = "#EAF1ED",
+          colour = "#91A99F", linewidth = 0.25) + # region map
+  geom_sf(data = observations, colour = "#C84E3B",
+          alpha = 0.45, size = 0.55) +            # observation points
+  coord_sf(expand = FALSE, datum = NA) +
+  labs(title = paste(tick$common, "|", tick$latin),
+       subtitle = paste(format(nrow(records), big.mark = ","),
+                        "supplied observation records"),
+       caption = "Dots show reported locations, not surveyed absences") +
+  theme_void(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", size = 17, colour = "#17394A"),
+        plot.subtitle = element_text(colour = "#536A71"),
+        plot.caption = element_text(colour = "#536A71"),
+        plot.background = element_rect(fill = "white", colour = NA))
+
+print(tick_map)
+ggsave(file.path(out_dir, "01_tick_observations.png"), plot = tick_map,
+       width = 7, height = 8, dpi = 250, bg = "white")
+```
+```{r}
+# label the land cover and a copy of one climate layer with explicit coordinate systems
+terra::crs(forest_sn) <- "+proj=laea +lat_0=52 +lon_0=10 +x_0=4321000 +y_0=3210000 +ellps=GRS80 +units=m +no_defs"
+climate_grid <- climate[[1]]                              # copy of one climate layer, used only as the target grid
+terra::crs(climate_grid) <- "+proj=longlat +datum=WGS84 +no_defs"
+
+# share of forest and semi natural land in each climate cell (0 = none, 1 = all)
+forest_grid <- terra::project(forest_sn, climate_grid, method = "average")
+names(forest_grid) <- "forest_grid"     # variable name 
+
+# one stack with all predictors; NA wherever land cover is missing, so every layer covers the same cells
+env <- terra::mask(c(climate, forest_grid), forest_grid)
+names(env)                                              
+```
+```{r}
+xy <- as.data.frame(sf::st_coordinates(observations))          # tick coordinates in lon/lat
+names(xy) <- c("x", "y")
+presence <- as.data.frame(SDMtune::thinData(xy, env = env))    # at most one record per grid cell
+
+background <- terra::spatSample(env[[1]], size = 2000,         # 2000 random cells across Sweden
+                                method = "random", na.rm = TRUE,
+                                xy = TRUE, values = FALSE)
+
+cat("Original records:", nrow(records), "\n")
+cat("Cells retained for modelling:", nrow(presence), "\n")
+
+samples <- SDMtune::prepareSWD(species = tick$latin,           # predictor values at presence and background points
+                               p = presence, a = background,
+                               env = env)
+
+# Hold back 20% of presence cells for a brief predictive check later.
+parts <- SDMtune::trainValTest(samples, test = 0.2,
+                               only_presence = TRUE, seed = 42)
+
+model <- SDMtune::train(method = "Maxnet", data = parts[[1]],  # fit on the training part
+                        fc = "lq", reg = 1)                    # linear + quadratic features, regularisation 1
+model
+```
+```{r suitability-map}
+suitability <- predict(model, data = env, type = "logistic")   # suitability score (0-1) for every cell, from climate + forest_grid
+
+palette <- c("#143D55", "#287D91", "#A5CCC0", "#F4D392", "#D76346")   # blue (low) to coral (high)
+map_cells <- as.data.frame(suitability, xy = TRUE, na.rm = TRUE)       # raster to a table with x, y and score
+names(map_cells)[3] <- "score"                                         # name the score column
+
+suitability_map <- ggplot(map_cells, aes(x = x, y = y, fill = score)) +
+  geom_raster() +                                                       # colour each cell by its score
+  geom_sf(data = sf::st_as_sf(nuts3_clim), inherit.aes = FALSE,
+          fill = NA, colour = "#294851", linewidth = 0.25) +            # region borders on top
+  scale_fill_gradientn(colours = palette, limits = c(0, 1),
+                       name = "Relative\nsuitability") +                # same colour scale for every map
+  coord_sf(expand = FALSE, datum = NA) +                                # no padding, no lat/lon grid
+  labs(title = "Common Tick Suitability Map for Sweden",
+       subtitle = paste(tick$latin, "| Climate + forest and semi natural land | Sweden"),
+       caption = "Relative suitability from climate and land cover") +
+  theme_void(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", size = 16, colour = "#17394A"),
+        plot.subtitle = element_text(colour = "#536A71"),
+        plot.caption = element_text(colour = "#536A71"),
+        legend.position = "bottom",
+        legend.key.width = grid::unit(1.5, "cm"),
+        plot.background = element_rect(fill = "white", colour = NA))
+
+print(suitability_map)                                                  # show the map
+ggsave(file.path(out_dir, "02_suitability_climate_landcover.png"),     # save it as a PNG in the results folder
+       plot = suitability_map, width = 8, height = 8, dpi = 250, bg = "white")
+```
+```{r}
+train_auc <- SDMtune::auc(model)                        # AUC on the training data
+test_auc  <- SDMtune::auc(model, test = parts[[2]])     # AUC on the 20% held-out presence cells
+cat(sprintf("Training AUC: %.3f | Held-out AUC: %.3f\n", train_auc, test_auc))
+
+roc_plot <- SDMtune::plotROC(model, test = parts[[2]]) +
+  labs(title = paste("A predictive check for", tick$latin),
+       subtitle = "Climate + land cover model: training and held-out presence versus background") +
+  theme_minimal(base_size = 12)
+
+print(roc_plot)                                         
+ggsave(file.path(out_dir, "03_roc.png"), plot = roc_plot,
+       width = 7, height = 5, dpi = 220, bg = "white")
+
+vi <- SDMtune::varImp(model, permut = 5)                # how much each predictor contributes
+vi                                                      # print the importance table
+SDMtune::plotVarImp(vi)                                 # bar chart of the importance
+```
+```{r}
+response_labels <- c(bio1        = "Annual mean temperature",
+                     bio12       = "Annual precipitation",
+                     bio15       = "Precipitation seasonality",
+                     forest_grid = "Forest and semi natural share")
+
+for (v in names(env)) {           # one curve per predictor
+  curve <- SDMtune::plotResponse(
+    model, var = v, type = "logistic",
+    marginal = TRUE, rug = TRUE        # rug marks show where the data lie
+  ) +
+    labs(title = response_labels[[v]],
+         subtitle = paste("Model response for", tick$latin),
+         y = "Relative suitability score") +
+    theme_minimal(base_size = 12)
+
+  print(curve)
+  ggsave(file.path(out_dir, paste0("response_", v, ".png")),
+         plot = curve, width = 7, height = 4.5, dpi = 220)
+}
+```
+
+# For characterising uncertainity
+
+can run bootstraping and refit the Maxnet model
+observational uncertainity is present 
+
