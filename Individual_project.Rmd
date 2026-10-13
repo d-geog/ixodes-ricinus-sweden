@@ -92,6 +92,7 @@ stopifnot(nrow(nuts3_se) == 21) # sweden has 21 NUTS3 regions
 terra::writeVector(nuts3_se, "data/Sweden_NUTS3.gpkg", overwrite = TRUE) #Save the cropped Sweden file as GeoPackage
 
 terra::plot(nuts3_se, col = "#A5CCC0", border = "#294851", main = "Sweden NUTS 3 (län)")
+terra::text(nuts3_se, "NUTS_ID", cex = 0.6)
 ```
 
 ```{r landcover_data_preparation}
@@ -190,26 +191,18 @@ terra::freq(lc_level1)                                 # check: exactly 5 classe
 ```{r}
 # forest and semi natural = CLC level 1 class 3 = GRID_CODE 23 to 34
 # from, to, becomes; right = NA makes the interval closed on both sides, so 23 and 34 are included
-forest_sn <- terra::classify(landcover, rcl = matrix(c(23, 34, 1), ncol = 3),
+forest_sn <- terra::classify(landcover, rcl = matrix(c(23, 29, 1), ncol = 3),
                              others = 0, right = NA)   # forest and semi natural = 1, everything else = 0
 names(forest_sn) <- "forest_sn"                        # name the new layer
 
 terra::plot(forest_sn, col = c("white", "forestgreen"),
-            main = "Forest and semi natural (1) vs. other land (0)")   # map of the layer
+            main = "Forest and vegetation associations vs. other land")   # map of the layer (0 for non forest and 1 for forest)
 terra::lines(nuts3_se, col = "black", lwd = 0.6)                      # region borders on top
 
 terra::freq(forest_sn)                                 # number of cells in each class
 ```
-```{r}
-# forest = CLC 311, 312, 313 = GRID_CODE 23, 24, 25 (exact values, so no intervals needed)
-forest <- terra::classify(landcover, rcl = cbind(c(23, 24, 25), 1), others = 0)  # forest = 1, everything else = 0
-names(forest) <- "forest"                              # name the new layer
 
-terra::plot(forest, col = c("white", "forestgreen"), main = "Forest (1) vs. non-forest (0)")  # forest map
-terra::lines(nuts3_se, col = "black", lwd = 0.6)       # region borders on top
 
-terra::freq(forest)                                    # number of forest and non-forest cells
-```
 ```{r}
 records <- read.csv(file.path("data", tick$file), skip = 2, sep = ",",
                     fileEncoding = "latin1") # read the Artportalen file (header starts on line 3)
@@ -242,6 +235,7 @@ print(tick_map)
 ggsave(file.path(out_dir, "01_tick_observations.png"), plot = tick_map,
        width = 7, height = 8, dpi = 250, bg = "white")
 ```
+
 ```{r}
 # label the land cover and a copy of one climate layer with explicit coordinate systems
 terra::crs(forest_sn) <- "+proj=laea +lat_0=52 +lon_0=10 +x_0=4321000 +y_0=3210000 +ellps=GRS80 +units=m +no_defs"
@@ -254,8 +248,11 @@ names(forest_grid) <- "forest_grid"     # variable name
 
 # one stack with all predictors; NA wherever land cover is missing, so every layer covers the same cells
 env <- terra::mask(c(climate, forest_grid), forest_grid)
-names(env)                                              
+names(env)
 ```
+
+
+
 ```{r}
 xy <- as.data.frame(sf::st_coordinates(observations))          # tick coordinates in lon/lat
 names(xy) <- c("x", "y")
@@ -280,6 +277,9 @@ model <- SDMtune::train(method = "Maxnet", data = parts[[1]],  # fit on the trai
                         fc = "lq", reg = 1)                    # linear + quadratic features, regularisation 1
 model
 ```
+
+
+
 ```{r suitability-map}
 suitability <- predict(model, data = env, type = "logistic")   # suitability score (0-1) for every cell, from climate + forest_grid
 
@@ -295,7 +295,7 @@ suitability_map <- ggplot(map_cells, aes(x = x, y = y, fill = score)) +
                        name = "Relative\nsuitability") +                # same colour scale for every map
   coord_sf(expand = FALSE, datum = NA) +                                # no padding, no lat/lon grid
   labs(title = "Common Tick Suitability Map for Sweden",
-       subtitle = paste(tick$latin, "| Climate + forest and semi natural land | Sweden"),
+       subtitle = paste(tick$latin, "| Climate + forest and vegetation | Sweden"),
        caption = "Relative suitability from climate and land cover") +
   theme_void(base_size = 12) +
   theme(plot.title = element_text(face = "bold", size = 16, colour = "#17394A"),
@@ -309,6 +309,9 @@ print(suitability_map)                                                  # show t
 ggsave(file.path(out_dir, "02_suitability_climate_landcover.png"),     # save it as a PNG in the results folder
        plot = suitability_map, width = 8, height = 8, dpi = 250, bg = "white")
 ```
+
+
+
 ```{r}
 train_auc <- SDMtune::auc(model)                        # AUC on the training data
 test_auc  <- SDMtune::auc(model, test = parts[[2]])     # AUC on the 20% held-out presence cells
@@ -327,6 +330,9 @@ vi <- SDMtune::varImp(model, permut = 5)                # how much each predicto
 vi                                                      # print the importance table
 SDMtune::plotVarImp(vi)                                 # bar chart of the importance
 ```
+
+
+
 ```{r}
 response_labels <- c(bio1        = "Annual mean temperature",
                      bio12       = "Annual precipitation",
@@ -349,8 +355,226 @@ for (v in names(env)) {           # one curve per predictor
 }
 ```
 
-# For characterising uncertainity
+```{r suitability-map-cropped}
+# --- Crop the suitability map to one NUTS3 region (SE124) ---
 
-can run bootstraping and refit the Maxnet model
-observational uncertainity is present 
+# Pick the polygon of the region from the NUTS3 layer (NUTS_ID is the region code column)
+region <- nuts3_clim[nuts3_clim$NUTS_ID == "SE124", ]
+
+# Stop with a clear message if the code was not found (should be exactly 1 polygon)
+stopifnot(nrow(region) == 1)
+
+# Crop: cut the raster down to the rectangle (bounding box) around the region
+suitability_crop <- terra::crop(suitability, region)
+
+# Mask: set every cell outside the region's real outline to NA, so only the region remains
+suitability_region <- terra::mask(suit_crop, region)
+
+# Name the layer so later code can refer to it
+names(suitability_region) <- "suitability"
+
+# Plot the result with the region outline on top
+terra::plot(suitability_region, col = palette, main = "Suitability in Orebro Lan")   # palette = your colour ramp from the map chunk
+palette <- c("#143D55", "#287D91", "#A5CCC0", "#F4D392", "#D76346")   # blue (low) to coral (high)
+
+terra::lines(region, col = palette, lwd = 1)                           # region border
+
+# Quick check: number of cells with a value in the region (this is your sample size for later)
+terra::global(!is.na(suitability_region), "sum")
+
+res(suitability_region)
+
+```
+```{r}
+# install.packages("fitdistrplus")
+library(fitdistrplus)
+```
+
+```{r}
+# Cut the forest layer to the same region (same grid as suitability_region, so cells line up)
+forest_region <- terra::mask(terra::crop(env[["forest_grid"]], region), region)
+
+# Put suitability and forest share in one table, one row per cell, dropping empty cells
+cells <- as.data.frame(c(suitability_region, forest_region), na.rm = TRUE)   # columns: suitability, forest_grid
+
+# Keep only forest cells; 0.5 = at least half of the cell is forest (your choice, state it in the report)
+forest_cells <- cells[cells$forest_grid >= 0.35, ]
+nrow(forest_cells)                                
+```
+```{r}
+# Show a summary of the suitability values in SE124 (min, quartiles, mean, max)
+summary(terra::values(suit_region, na.rm = TRUE))
+
+# Draw a histogram to see how the values are spread across the region's cells
+hist(terra::values(suit_region, na.rm = TRUE),
+     breaks = 20,                                    # number of bars
+     main = "Suitability values in SE124",           # title
+     xlab = "Suitability score (0-1)")               # x-axis label
+
+# See the inputs behind each cell's score: climate, forest share and suitability in one table
+head(as.data.frame(c(suit_region, env[[1:4]] |> terra::crop(region) |> terra::mask(region)),
+                   xy = TRUE, na.rm = TRUE))         # first 6 cells; x, y are cell-centre coordinates
+```
+
+
+
+```{r fit-beta, fig.width=8, fig.height=7}
+# Beta needs values strictly between 0 and 1, so pull exact 0s and 1s slightly inwards
+x <- pmin(pmax(forest_cells$suitability, 0.001), 0.999)
+
+# Fit distribution to data using maximum likelihood 
+fit_beta <- fitdist(x,distr= "beta", method = "mle")
+plot(fit_beta)
+AIC(fit_beta)
+fit_beta$estimate
+# For example, if the distribution is beta one can generate 10 random numbers like this
+rbeta(10,shape1=fit_beta$estimate[1],shape2=fit_beta$estimate[2])
+```
+```{r fit-beta, fig.width=8, fig.height=7 }
+# Fit distribution to data using maximum likelihood 
+fit3 <- fitdist(x,distr= "gamma", method = "mle")
+# Generates plots comparing empirical cdf with fitted cdf, and histogram with fitted pdf
+plot(fit3)
+# Extract the parameters for the fitted distribution. You use these values to sample or calculate things from the distribution 
+fit3$estimate
+# For example, if the distribution is beta one can generate 10 random numbers like this
+rgamma(10,shape=fit3$estimate[1],rate=fit_beta$estimate[2])
+```
+```{r}
+# Extract goodness of fit as an AIC-value and compare the two candidate models. Lower AIC is better model
+AIC(fit_beta) # beta
+AIC(fit3) # gamma
+
+
+```
+
+```{r fit-beta, fig.width=8, fig.height=7 }
+# Fit distribution to data using maximum likelihood 
+fit4 <- fitdist(x,distr= "lnorm", method = "mle")
+# Generates plots comparing empirical cdf with fitted cdf, and histogram with fitted pdf
+plot(fit4)
+# Extract the parameters for the fitted distribution. You use these values to sample or calculate things from the distribution 
+fit4$estimate
+# For example, if the distribution is beta one can generate 10 random numbers like this
+AIC(fit4)
+```
+```{r}
+# --- p95 of the fitted beta distribution, SE124 forest cells ---
+
+# Read the two beta shape parameters from the fit
+shape1 <- fit_beta$estimate[["shape1"]]     # first shape parameter
+shape2 <- fit_beta$estimate[["shape2"]]     # second shape parameter
+
+# 95th percentile of the fitted beta: 95% of forest cells have a suitability below this value
+p95 <- qbeta(0.95, shape1 = shape1, shape2 = shape2)
+p95                                          # print the value
+
+# Check against the raw data: the empirical 95th percentile should be close to p95
+quantile(x, 0.95)
+
+# Plot the data and fitted curve, with p95 marked as a dashed line
+hist(x, breaks = 20, freq = FALSE,                       # histogram on a density scale
+     main = "Suitability in forest cells, SE124",        # title
+     xlab = "Suitability score (0-1)")                   # x-axis label
+curve(dbeta(x, shape1, shape2), add = TRUE, lwd = 2)     # fitted beta curve
+abline(v = p95, lty = 2, lwd = 2)                        # dashed line at p95
+```
+```{r}
+# --- Single risk value for SE124: p95 suitability x prevalence ---
+
+prevalence <- 0.0023                                   # prevalence of infected ticks: 0.23 % (Jaenson et al. 2014), as a proportion
+
+# 95th percentile of the fitted beta = conservative suitability for forest cells in SE124
+HSI <- qbeta(0.95, shape1 = fit_beta$estimate[["shape1"]], shape2 = fit_beta$estimate[["shape2"]])
+
+# Risk = P(tick | forest, region) x P(infected | tick) = P(infected | forest)
+risk_orebro <- HSI * prevalence
+
+# Print the pieces and the result
+c(HSI = HSI, prevalence = prevalence, risk = risk_orebro)   # the three numbers used
+round(risk_orebro * 100, 3)                           # risk as a percentage (relative indicator)
+```
+```{r}
+# --- Chunk 1 (region version): bootstrap the model, predict only in SE124 ---
+
+set.seed(42)                                   # makes the random resampling repeatable
+n_boot <- 200                                   # test with 10, then use 200
+
+# NEW: climate and forest layers cut to SE124 only, used for prediction in every round
+env_region <- terra::mask(terra::crop(env, region), region)           # SE124 cells with bio1, bio12, bio15, forest_grid
+forest_vals <- terra::values(env_region[["forest_grid"]])[, 1]        # forest share of each SE124 cell
+
+boot_maps <- vector("list", n_boot)            # holds one SE124 suitability map per round
+p95_boot  <- rep(NA_real_, n_boot)             # holds one p95 value per round
+
+for (i in seq_len(n_boot)) {
+
+  # 1. Resample ALL presence records with replacement (the model still needs the whole of Sweden)
+  idx    <- sample(nrow(presence), size = nrow(presence), replace = TRUE)
+  pres_b <- presence[idx, ]
+
+  # 2. New random background points over Sweden
+  bg_b <- terra::spatSample(env[[1]], size = 2000, method = "random",
+                            na.rm = TRUE, xy = TRUE, values = FALSE)
+
+  # 3. Training data and 4. refit Maxnet with the same settings
+  swd_b   <- SDMtune::prepareSWD(species = tick$latin, p = pres_b, a = bg_b, env = env)
+  model_b <- tryCatch(
+    SDMtune::train(method = "Maxnet", data = swd_b, fc = "lq", reg = 1),
+    error = function(e) NULL                   # skip the round if the fit fails
+  )
+  if (is.null(model_b)) next
+
+  # 5. CHANGED: predict only for the SE124 cells (small raster, fast)
+  map_b <- predict(model_b, data = env_region, type = "logistic")
+  boot_maps[[i]] <- map_b                      # store the SE124 map
+
+  # 6. p95 of the forest cells in this round's SE124 map
+  vals_b <- terra::values(map_b)[, 1]                                  # suitability of every SE124 cell
+  keep   <- !is.na(vals_b) & !is.na(forest_vals) & forest_vals >= 0.5  # forest cells only (same 0.5 rule)
+  p95_boot[i] <- quantile(vals_b[keep], 0.95)                          # 95th percentile of those cells
+
+  if (i %% n_boot == 0) cat("Finished round", i, "of", n_boot, "\n")
+}
+
+ok <- !vapply(boot_maps, is.null, logical(1))   # TRUE for rounds that worked
+boot_stack <- do.call(c, boot_maps[ok])         # combine the SE124 maps into one multi-layer raster
+p95_boot   <- p95_boot[ok]                      # keep the matching p95 values
+cat(sum(ok), "of", n_boot, "rounds succeeded\n")
+```
+```{r}
+# --- Chunk 2 (region version): uncertainty maps and risk range for SE124 ---
+
+mean_map <- terra::mean(boot_stack)             # average suitability per cell in SE124
+sd_map   <- terra::stdev(boot_stack)            # variation between rounds per cell (uncertainty)
+
+terra::writeRaster(mean_map, file.path(out_dir, "boot_mean_SE124.tif"), overwrite = TRUE)   # save mean map
+terra::writeRaster(sd_map,   file.path(out_dir, "boot_sd_SE124.tif"),   overwrite = TRUE)   # save uncertainty map
+
+cols_suit <- colorRampPalette(c("#143D55", "#287D91", "#A5CCC0", "#F4D392", "#D76346"))(100)   # suitability colours
+cols_unc  <- colorRampPalette(c("white", "#F4D392", "#D76346", "#7A1F13"))(100)                # uncertainty colours
+
+par(mfrow = c(1, 2))                                                                  # two panels
+terra::plot(mean_map, col = cols_suit, main = "Mean suitability, SE124")              # mean map
+terra::lines(region, col = "#294851", lwd = 1)                                        # CHANGED: SE124 outline only
+terra::plot(sd_map, col = cols_unc, main = "Uncertainty (SD), SE124")                 # uncertainty map
+terra::lines(region, col = "#294851", lwd = 1)                                        # SE124 outline
+par(mfrow = c(1, 1))
+
+prev_central <- 0.0023                                    # 0.23 % (Jaenson et al. 2014)
+risk_model   <- p95_boot * prev_central                   # model uncertainty only
+
+set.seed(42)
+prev_draw <- runif(length(p95_boot), 0.0010, 0.0055)      # prevalence varied from 0.10 % to 0.55 %
+risk_all  <- p95_boot * prev_draw                         # model + prevalence uncertainty
+
+rbind(                                                    # 5th, 50th and 95th percentiles
+  p95_suitability = quantile(p95_boot, c(0.05, 0.5, 0.95)),
+  risk_model_only = quantile(risk_model, c(0.05, 0.5, 0.95)),
+  risk_model_prev = quantile(risk_all,   c(0.05, 0.5, 0.95))
+)
+
+hist(risk_all * 100, breaks = 20, main = "Bootstrap risk in SE124", xlab = "Risk (%)")   # risk distribution
+abline(v = quantile(risk_all * 100, c(0.05, 0.95)), lty = 2)                              # 90 % range
+```
 
