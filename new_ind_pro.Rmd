@@ -1,0 +1,642 @@
+---
+title: "Individual Project Ixodes ricinus in Sweden"
+author: "Devika Kuzhupadickal Sreekumar"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+Assess the distribution for the tick 'Ixodes ricinus' in Sweden, produce a map and compare the predicted distribution for this species with the ECDC map.
+
+**Tasks**
+
+- Model compared to original assessment
+- SDM based on another data set, with another model method and only in Sweden.
+- Characterise uncertainty by model calibration where you change what data that is used (bootstrapping) and propagate to the SDM output.
+- Summarise uncertainty in selected regions on the edge of the distribution
+- Use your assessment to conclude if there is a concern to get bitten by a tick and become infected with tick-borne encephalitis virus (TBE). Provide your conclusion with an assessment of overall uncertainty, one per country.
+
+**Approach**
+
+We use species data and habitat suitability data (climate data and land cover information) in a species distribution model (SDM).
+
+The modelling method is **Maxnet**, an R implementation of maximum entropy modelling. It compares the conditions at recorded locations with conditions available across the study area and it does **not** need confirmed absences.
+
+| Choose this key | Swedish name | Scientific name  | Records supplied |
+|-----------------|--------------|------------------|------------------|
+| `"common_tick"` | Common tick  | *Ixodes ricinus* | 2275             |
+
+**Quantity of interest:** p(inf | forest, region), the probability to be infected when out in a forest in the selected region (here Örebro län, NUTS3 code SE124).
+
+## 1. Setup
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center", out.width = "90%")
+
+packages <- c("SDMtune", "terra", "sf", "ggplot2", "fitdistrplus")
+missing <- packages[!vapply(packages, requireNamespace, logical(1),
+                            quietly = TRUE)]
+if (length(missing)) {
+  stop("Install these R packages: ", paste(missing, collapse = ", "))
+}
+
+library(SDMtune)
+library(terra)
+library(sf)
+library(ggplot2)
+library(fitdistrplus)
+
+set.seed(42)                                      # repeatable thinning, background sampling and bootstraps
+n_iter  <- 2000                                   # bootstrap / Monte Carlo iterations
+q_probs <- c(0.05, 0.25, 0.50, 0.75, 0.95)        # quantiles used in the whole assessment
+q_names <- c("P5", "P25", "P50", "P75", "P95")
+```
+
+## 2. Species data
+
+The species data is from artportalen.se for *Ixodes ricinus*, period 2000 - 2026, around 2275 tick observations for Sweden.
+
+```{r choose-species}
+species_key <- "common_tick"
+
+species <- list(
+  common_tick = list(file = "Tick_data.csv",
+                     common = "Common tick",
+                     latin = "Ixodes ricinus")
+)
+
+stopifnot(species_key %in% names(species))
+tick <- species[[species_key]]
+out_dir <- file.path("results", species_key)
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+tick$latin
+```
+
+## 3. Climate and land cover data (habitat suitability data)
+
+We use three CHELSA variables: mean annual temperature (**BIO1**), annual precipitation (**BIO12**) and precipitation seasonality (**BIO15**). Land cover comes from CORINE Land Cover (CLC). Sweden is the study area, neighbouring countries are cropped out.
+
+```{r NUTS-data-preparation, eval=FALSE}
+nuts_all <- terra::vect("data/NUTS.gpkg")                                    # Europe wide data
+nuts3_se <- nuts_all[nuts_all$CNTR_CODE == "SE" & nuts_all$LEVL_CODE == 3, ] # Sweden, level 3 (län)
+stopifnot(nrow(nuts3_se) == 21)                                              # Sweden has 21 NUTS3 regions
+
+terra::writeVector(nuts3_se, "data/Sweden_NUTS3.gpkg", overwrite = TRUE)
+
+terra::plot(nuts3_se, col = "#A5CCC0", border = "#294851", main = "Sweden NUTS 3 (län)")
+terra::text(nuts3_se, "NUTS_ID", cex = 0.6)
+```
+
+```{r landcover-data-preparation, eval=FALSE}
+landcover <- terra::rast("data/LC_Corine.tif")
+nuts3_se  <- terra::vect("data/Sweden_NUTS3.gpkg")
+
+terra::crs(landcover) <- terra::crs(nuts3_se)                  # same coordinate system
+
+lc_sweden <- terra::mask(terra::crop(landcover, nuts3_se), nuts3_se)
+
+terra::writeRaster(lc_sweden, "data/LC_Sweden_cropped.tif",
+                   overwrite = TRUE, datatype = "INT2U")
+
+terra::plot(lc_sweden, main = "Land cover, Sweden")
+terra::lines(nuts3_se, col = "black")
+
+terra::crs(lc_sweden, describe = TRUE)$name                    # should say ETRS89-extended / LAEA Europe
+```
+
+```{r input-data}
+inputs <- c("data/climate_sweden.tif",
+            "data/LC_Sweden_cropped.tif",
+            "data/Sweden_NUTS3.gpkg",
+            "data/Tick_data.csv")
+
+if (!all(file.exists(inputs))) {
+  stop("Missing input files: ", paste(inputs[!file.exists(inputs)], collapse = ", "))
+}
+```
+
+```{r climate-data}
+climate  <- terra::rast("data/climate_sweden.tif")
+nuts3_se <- terra::vect("data/Sweden_NUTS3.gpkg")
+
+stopifnot(terra::nlyr(climate) == 3)
+names(climate) <- c("bio1", "bio12", "bio15")
+
+# the raster is in lon/lat and the regions in metres, so transform the regions to lon/lat
+nuts3_clim <- terra::vect(sf::st_transform(sf::st_as_sf(nuts3_se), 4326))
+
+cols <- grDevices::colorRampPalette(
+  c("#143D55", "#287D91", "#A5CCC0", "#F4D392", "#D76346")
+)(100)
+
+terra::plot(climate[[1]], col = cols, main = "Annual mean temperature")
+terra::lines(nuts3_clim, col = "#294851", lwd = 0.6)
+
+terra::plot(climate[[2]], col = cols, main = "Total annual precipitation")
+terra::lines(nuts3_clim, col = "#294851", lwd = 0.6)
+
+terra::plot(climate[[3]], col = cols, main = "Precipitation seasonality")
+terra::lines(nuts3_clim, col = "#294851", lwd = 0.6)
+```
+
+```{r landcover-data}
+landcover <- terra::rast("data/LC_Sweden_cropped.tif")
+nuts3_se  <- terra::vect("data/Sweden_NUTS3.gpkg")
+
+names(landcover) <- "landcover"
+landcover[landcover %in% c(48, 255)] <- NA        # NODATA / unclassified codes become NA
+terra::freq(landcover)
+```
+
+```{r landcover-reclassification}
+# reclassification table: from, to, becomes
+rcl <- matrix(c(
+   1, 11, 1,   # Artificial surfaces
+  12, 22, 2,   # Agricultural areas
+  23, 34, 3,   # Forest and semi natural areas
+  35, 39, 4,   # Wetlands
+  40, 44, 5    # Water bodies
+), ncol = 3, byrow = TRUE)
+
+# right = NA makes the intervals closed on both sides
+lc_level1 <- terra::classify(landcover, rcl, include.lowest = TRUE, right = NA)
+names(lc_level1) <- "lc_level1"
+
+levels(lc_level1) <- data.frame(
+  id    = 1:5,
+  class = c("Artificial surfaces", "Agricultural areas",
+            "Forest and semi natural", "Wetlands", "Water bodies")
+)
+lc_cols <- c("red", "yellow", "forestgreen", "brown", "blue")
+
+terra::plot(lc_level1, col = lc_cols, main = "Land cover (CLC level 1)")
+terra::lines(nuts3_se, col = "black", lwd = 0.6)
+
+terra::freq(lc_level1)                             # exactly 5 classes and no NA row
+```
+
+```{r forest-vegetation-layer}
+# forest and vegetation = CLC GRID_CODE 23 to 29 (CLC 311-324)
+forest_sn <- terra::classify(landcover, rcl = matrix(c(23, 29, 1), ncol = 3),
+                             others = 0, right = NA)   # forest and semi natural = 1, other = 0
+names(forest_sn) <- "forest_sn"
+
+terra::plot(forest_sn, col = c("white", "forestgreen"),
+            main = "Forest and vegetation associations vs. other land")
+terra::lines(nuts3_se, col = "black", lwd = 0.6)
+
+terra::freq(forest_sn)
+```
+
+## 4. Tick observations
+
+```{r tick-observation}
+records <- read.csv(file.path("data", tick$file), skip = 2, sep = ",",
+                    fileEncoding = "latin1")           # header starts on line 3
+
+stopifnot(all(c("Ost", "Nord") %in% names(records)))
+records <- records[complete.cases(records[, c("Ost", "Nord")]), ]
+
+observations <- sf::st_as_sf(records, coords = c("Ost", "Nord"), crs = 3021)
+observations <- sf::st_transform(observations, 4326)
+
+regions <- sf::st_transform(sf::st_read("data/Sweden_NUTS3.gpkg", quiet = TRUE), 4326)
+
+tick_map <- ggplot() +
+  geom_sf(data = regions, fill = "#EAF1ED",
+          colour = "#91A99F", linewidth = 0.25) +
+  geom_sf(data = observations, colour = "#C84E3B",
+          alpha = 0.45, size = 0.55) +
+  coord_sf(expand = FALSE, datum = NA) +
+  labs(title = paste(tick$common, "|", tick$latin),
+       subtitle = paste(format(nrow(records), big.mark = ","),
+                        "supplied observation records"),
+       caption = "Dots show reported locations, not surveyed absences") +
+  theme_void(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", size = 17, colour = "#17394A"),
+        plot.subtitle = element_text(colour = "#536A71"),
+        plot.caption = element_text(colour = "#536A71"),
+        plot.background = element_rect(fill = "white", colour = NA))
+
+print(tick_map)
+ggsave(file.path(out_dir, "01_tick_observations.png"), plot = tick_map,
+       width = 7, height = 8, dpi = 250, bg = "white")
+```
+
+## 5. Habitat suitability model (Maxnet)
+
+```{r habitat-predictors}
+# label the land cover and a copy of one climate layer with explicit coordinate systems
+terra::crs(forest_sn) <- "+proj=laea +lat_0=52 +lon_0=10 +x_0=4321000 +y_0=3210000 +ellps=GRS80 +units=m +no_defs"
+climate_grid <- climate[[1]]                       # used only as the target grid
+terra::crs(climate_grid) <- "+proj=longlat +datum=WGS84 +no_defs"
+
+# share of forest and semi natural land in each climate cell (0 = none, 1 = all)
+forest_grid <- terra::project(forest_sn, climate_grid, method = "average")
+names(forest_grid) <- "forest_grid"
+
+# one stack with all predictors; NA wherever land cover is missing
+env <- terra::mask(c(climate, forest_grid), forest_grid)
+names(env)
+```
+
+```{r fit-model}
+xy <- as.data.frame(sf::st_coordinates(observations))
+names(xy) <- c("x", "y")
+presence <- as.data.frame(SDMtune::thinData(xy, env = env))    # at most one record per grid cell
+
+background <- terra::spatSample(env[[1]], size = 2000,
+                                method = "random", na.rm = TRUE,
+                                xy = TRUE, values = FALSE)
+
+cat("Original records:", nrow(records), "\n")
+cat("Cells retained for modelling:", nrow(presence), "\n")
+
+samples <- SDMtune::prepareSWD(species = tick$latin,
+                               p = presence, a = background,
+                               env = env)
+
+# hold back 20% of presence cells for a predictive check
+parts <- SDMtune::trainValTest(samples, test = 0.2,
+                               only_presence = TRUE, seed = 42)
+
+model <- SDMtune::train(method = "Maxnet", data = parts[[1]],
+                        fc = "lq", reg = 1)                    # linear + quadratic features
+model
+```
+
+```{r suitability-map}
+suitability <- predict(model, data = env, type = "logistic")   # suitability score (0-1) per cell
+
+palette <- c("#143D55", "#287D91", "#A5CCC0", "#F4D392", "#D76346")
+map_cells <- as.data.frame(suitability, xy = TRUE, na.rm = TRUE)
+names(map_cells)[3] <- "score"
+
+suitability_map <- ggplot(map_cells, aes(x = x, y = y, fill = score)) +
+  geom_raster() +
+  geom_sf(data = sf::st_as_sf(nuts3_clim), inherit.aes = FALSE,
+          fill = NA, colour = "#294851", linewidth = 0.25) +
+  scale_fill_gradientn(colours = palette, limits = c(0, 1),
+                       name = "Relative\nsuitability") +
+  coord_sf(expand = FALSE, datum = NA) +
+  labs(title = "Common Tick Suitability Map for Sweden",
+       subtitle = paste(tick$latin, "| Climate + forest and vegetation | Sweden"),
+       caption = "Relative suitability from climate and land cover") +
+  theme_void(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", size = 16, colour = "#17394A"),
+        plot.subtitle = element_text(colour = "#536A71"),
+        plot.caption = element_text(colour = "#536A71"),
+        legend.position = "bottom",
+        legend.key.width = grid::unit(1.5, "cm"),
+        plot.background = element_rect(fill = "white", colour = NA))
+
+print(suitability_map)
+ggsave(file.path(out_dir, "02_suitability_climate_landcover.png"),
+       plot = suitability_map, width = 8, height = 8, dpi = 250, bg = "white")
+```
+
+```{r model-check}
+train_auc <- SDMtune::auc(model)
+test_auc  <- SDMtune::auc(model, test = parts[[2]])
+cat(sprintf("Training AUC: %.3f | Held-out AUC: %.3f\n", train_auc, test_auc))
+
+roc_plot <- SDMtune::plotROC(model, test = parts[[2]]) +
+  labs(title = paste("A predictive check for", tick$latin),
+       subtitle = "Climate + land cover model: training and held-out presence versus background") +
+  theme_minimal(base_size = 12)
+
+print(roc_plot)
+ggsave(file.path(out_dir, "03_roc.png"), plot = roc_plot,
+       width = 7, height = 5, dpi = 220, bg = "white")
+
+vi <- SDMtune::varImp(model, permut = 5)           # contribution of each predictor
+vi
+SDMtune::plotVarImp(vi)
+```
+
+```{r response-curves}
+response_labels <- c(bio1        = "Annual mean temperature",
+                     bio12       = "Annual precipitation",
+                     bio15       = "Precipitation seasonality",
+                     forest_grid = "Forest and semi natural share")
+
+for (v in names(env)) {
+  response_plot <- SDMtune::plotResponse(
+    model, var = v, type = "logistic",
+    marginal = TRUE, rug = TRUE
+  ) +
+    labs(title = response_labels[[v]],
+         subtitle = paste("Model response for", tick$latin),
+         y = "Relative suitability score") +
+    theme_minimal(base_size = 12)
+
+  print(response_plot)
+  ggsave(file.path(out_dir, paste0("response_", v, ".png")),
+         plot = response_plot, width = 7, height = 4.5, dpi = 220)
+}
+```
+
+## 6. Örebro län (SE124)
+
+```{r orebro-suitability}
+# crop cuts the bounding box, mask removes cells outside the border
+orebro <- nuts3_clim[nuts3_clim$NUTS_ID == "SE124", ]
+stopifnot(nrow(orebro) == 1)
+
+suitability_crop   <- terra::crop(suitability, orebro)
+suitability_orebro <- terra::mask(suitability_crop, orebro)
+names(suitability_orebro) <- "suitability"
+
+orebro_cells <- as.data.frame(suitability_orebro, xy = TRUE, na.rm = TRUE)
+
+orebro_map <- ggplot(orebro_cells, aes(x = x, y = y, fill = suitability)) +
+  geom_raster() +
+  geom_sf(data = sf::st_as_sf(orebro), inherit.aes = FALSE,
+          fill = NA, colour = "#294851", linewidth = 0.5) +
+  scale_fill_gradientn(colours = palette, limits = c(0, 1),
+                       name = "Relative\nsuitability") +
+  coord_sf(expand = FALSE, datum = NA) +
+  labs(title = "Suitability in Orebro lan") +
+  theme_void(base_size = 12) +
+  theme(legend.position = "bottom",
+        plot.background = element_rect(fill = "white", colour = NA))
+
+print(orebro_map)
+ggsave(file.path(out_dir, "06_suitability_Orebro.png"), plot = orebro_map,
+       width = 6, height = 6, dpi = 250, bg = "white")
+
+terra::global(!is.na(suitability_orebro), "sum")   # number of cells with a value in Orebro
+res(suitability_orebro)                            # cell size in degrees
+```
+
+```{r orebro-forest-cells}
+# forest layer cut to Orebro (same grid as suitability_orebro)
+forest_orebro <- terra::mask(terra::crop(env[["forest_grid"]], orebro), orebro)
+
+cells <- as.data.frame(c(suitability_orebro, forest_orebro), na.rm = TRUE)
+
+# forest cells = at least 35 % forest share (state this in the report)
+forest_threshold <- 0.35
+forest_cells <- cells[cells$forest_grid >= forest_threshold, ]
+nrow(forest_cells)
+
+summary(terra::values(suitability_orebro, na.rm = TRUE))
+
+hist(terra::values(suitability_orebro, na.rm = TRUE),
+     breaks = 20,
+     main = "Suitability values in Orebro",
+     xlab = "Suitability score (0-1)")
+```
+
+## 7. Distribution of suitability (HSI) in Örebro forest cells
+
+```{r fit-beta, fig.width=8, fig.height=7}
+# beta needs values strictly between 0 and 1
+x <- pmin(pmax(forest_cells$suitability, 0.001), 0.999)
+
+fit_beta <- fitdist(x, distr = "beta", method = "mle")
+plot(fit_beta)
+fit_beta$estimate
+```
+
+```{r fit-gamma, fig.width=8, fig.height=7}
+fit_gamma <- fitdist(x, distr = "gamma", method = "mle")
+plot(fit_gamma)
+fit_gamma$estimate
+```
+
+```{r fit-lnorm, fig.width=8, fig.height=7}
+fit_lnorm <- fitdist(x, distr = "lnorm", method = "mle")
+plot(fit_lnorm)
+fit_lnorm$estimate
+```
+
+```{r compare-AIC}
+# lower AIC = better fit
+AIC(fit_beta)
+AIC(fit_gamma)
+AIC(fit_lnorm)
+```
+
+```{r habitat-p95}
+shape1 <- fit_beta$estimate[["shape1"]]
+shape2 <- fit_beta$estimate[["shape2"]]
+
+# 95 % of forest cells have a suitability below this value
+p95 <- qbeta(0.95, shape1 = shape1, shape2 = shape2)
+p95
+quantile(x, 0.95)                                  # check: empirical p95 should be close
+
+draw_p95 <- function() {
+  hist(x, breaks = 20, freq = FALSE,
+       main = "Suitability in forest cells, Orebro",
+       xlab = "Suitability score (0-1)")
+  curve(dbeta(x, shape1, shape2), add = TRUE, lwd = 2)
+  abline(v = p95, lty = 2, lwd = 2)
+}
+draw_p95()
+
+png(file.path(out_dir, "04a_p95_Orebro.png"), width = 7, height = 5, units = "in", res = 250)
+draw_p95()
+invisible(dev.off())
+```
+
+## 8. First assessment: single value
+
+```{r orebro-probability}
+# p(inf | forest, Orebro) = HSI x prevalence of infected ticks
+low_prevalence     <- 0.0010   # 0.10 %  (Pettersson et al. 2014, lowest)
+central_prevalence <- 0.0023   # 0.23 %  (Pettersson et al. 2014, central)
+high_prevalence    <- 0.0055   # 0.55 %  (Pettersson et al. 2014, highest)
+
+HSI <- p95                     # conservative HSI (95th percentile of the fitted beta)
+
+p_inf_point <- HSI * central_prevalence
+cat("HSI:", round(HSI, 4), "\n")
+cat("Single value p(inf | forest, Orebro):", round(p_inf_point * 100, 3), "%\n")
+```
+
+## 9. Uncertainty
+
+### 9.1 Bootstrap of the HSI distribution (cells) and prevalence
+
+```{r bootstrap-cells}
+set.seed(42)
+boot_beta <- fitdistrplus::bootdist(fit_beta, bootmethod = "nonparam", niter = n_iter)
+
+# conservative HSI (p95 of the fitted beta) for each resample
+HSI_boot <- qbeta(0.95, boot_beta$estim$shape1, boot_beta$estim$shape2)
+
+# prevalence uncertainty: uniform between low and high (Pettersson et al. 2014)
+prevalence_draw <- runif(length(HSI_boot), low_prevalence, high_prevalence)
+
+# Monte Carlo: multiply HSI sample and prevalence sample
+p_inf_cell <- HSI_boot * prevalence_draw * 100     # in %
+
+# which source contributes what
+uncertainty_table <- rbind(
+  HSI_only        = quantile(HSI_boot * central_prevalence * 100, q_probs),
+  prevalence_only = quantile(median(HSI_boot) * prevalence_draw * 100, q_probs),
+  both            = quantile(p_inf_cell, q_probs)
+)
+colnames(uncertainty_table) <- q_names
+round(uncertainty_table, 3)
+
+write.csv(round(uncertainty_table, 4),
+          file.path(out_dir, "uncertainty_sources_Orebro.csv"))
+```
+
+```{r prevalence-uncertainty}
+# the prevalence draws used above, in %
+prev_pct <- prevalence_draw * 100
+q_prev <- quantile(prev_pct, q_probs)
+names(q_prev) <- q_names
+round(q_prev, 3)
+
+draw_prev <- function() {
+  hist(prev_pct, breaks = 30, freq = FALSE,
+       main = "Prevalence of infected ticks (uncertainty)", xlab = "Prevalence (%)")
+  abline(v = q_prev[c("P5", "P95")], col = "red", lty = 2, lwd = 2)
+  abline(v = q_prev["P50"], col = "red", lty = 1, lwd = 2)
+  abline(v = central_prevalence * 100, col = "blue", lty = 3, lwd = 2)
+  legend("topright", legend = c("Median", "P5 and P95", "Central value (0.23 %)"),
+         col = c("red", "red", "blue"), lty = c(1, 2, 3), lwd = 2, bty = "n")
+}
+draw_prev()
+
+png(file.path(out_dir, "08_prevalence_uncertainty.png"), width = 7, height = 5, units = "in", res = 250)
+draw_prev()
+invisible(dev.off())
+```
+
+### 9.2 Bootstrap of the Maxnet model
+
+```{r maxnet-bootstrapping, cache=TRUE}
+# refit Maxnet on resampled presence records and new background points
+n_boots   <- n_iter
+boot_list <- vector("list", n_boots)
+
+set.seed(42)
+for (i in seq_len(n_boots)) {
+  # 1. resample presence points with replacement
+  boot_presence <- presence[sample(nrow(presence), replace = TRUE), ]
+
+  # 2. new random background points
+  boot_background <- terra::spatSample(env[[1]], size = 2000,
+                                       method = "random", na.rm = TRUE,
+                                       xy = TRUE, values = FALSE)
+
+  # 3. prepare SWD object
+  boot_samples <- SDMtune::prepareSWD(species = tick$latin,
+                                      p = boot_presence,
+                                      a = boot_background,
+                                      env = env)
+
+  # 4. train Maxnet on the bootstrapped data
+  boot_model <- SDMtune::train(method = "Maxnet", data = boot_samples,
+                               fc = "lq", reg = 1)
+
+  # 5. predict suitability map for this iteration
+  boot_list[[i]] <- predict(boot_model, data = env, type = "logistic")
+
+  if (i %% 250 == 0) cat(sprintf("Completed bootstrap iteration %d of %d\n", i, n_boots))
+}
+
+boot_stack <- terra::rast(boot_list)
+names(boot_stack) <- paste0("boot_", seq_len(n_boots))
+```
+
+```{r probability-maps}
+# propagate the Maxnet bootstrap to Orebro maps (each map x one prevalence draw)
+stopifnot(terra::nlyr(boot_stack) == n_iter)
+
+boot_stack_orebro <- terra::mask(terra::crop(boot_stack, orebro), orebro)
+
+set.seed(42)
+prevalence_map_draw <- runif(terra::nlyr(boot_stack_orebro),
+                             low_prevalence, high_prevalence)
+
+p_inf_stack <- boot_stack_orebro * prevalence_map_draw * 100   # in %, layer-wise
+p_inf_mean  <- terra::mean(p_inf_stack, na.rm = TRUE)
+p_inf_sd    <- terra::stdev(p_inf_stack, na.rm = TRUE)
+
+cols_prob <- colorRampPalette(c("#143D55", "#287D91", "#A5CCC0", "#F4D392", "#D76346"))(100)
+cols_unc  <- colorRampPalette(c("white", "#F4D392", "#D76346", "#7A1F13"))(100)
+
+draw_prob_maps <- function() {
+  par(mfrow = c(1, 2))
+  terra::plot(p_inf_mean, col = cols_prob, main = "Mean probability (Orebro)")
+  terra::lines(orebro, col = "#294851", lwd = 1)
+  terra::plot(p_inf_sd, col = cols_unc, main = "SD of probability (Orebro)")
+  terra::lines(orebro, col = "#294851", lwd = 1)
+  par(mfrow = c(1, 1))
+}
+draw_prob_maps()
+
+png(file.path(out_dir, "05_probability_maps_Orebro.png"),
+    width = 10, height = 5, units = "in", res = 250)
+draw_prob_maps()
+invisible(dev.off())
+
+terra::writeRaster(p_inf_mean, file.path(out_dir, "probability_mean_Orebro.tif"), overwrite = TRUE)
+terra::writeRaster(p_inf_sd,   file.path(out_dir, "probability_sd_Orebro.tif"),   overwrite = TRUE)
+```
+
+## 10. Summary of the Monte Carlo result (input for the overall uncertainty judgement)
+
+```{r overall-uncertainty}
+# conservative HSI (p95 of forest cells) for each Maxnet bootstrap map
+f <- terra::values(forest_orebro)[, 1]
+
+HSI_boot_maxnet <- sapply(seq_len(terra::nlyr(boot_stack_orebro)), function(i) {
+  v <- terra::values(boot_stack_orebro[[i]])[, 1]
+  v <- v[!is.na(v) & !is.na(f) & f >= forest_threshold]
+  unname(quantile(v, 0.95))
+})
+
+p_inf_maxnet <- HSI_boot_maxnet * prevalence_map_draw * 100    # in %
+
+overall_table <- rbind(
+  cell_bootstrap   = quantile(p_inf_cell,   q_probs),
+  maxnet_bootstrap = quantile(p_inf_maxnet, q_probs)
+)
+colnames(overall_table) <- q_names
+
+round(p_inf_point * 100, 3)                        # first assessment, single value (%)
+round(overall_table, 3)
+
+# where the single value sits within the Maxnet bootstrap distribution
+mean(p_inf_maxnet <= p_inf_point * 100)
+
+write.csv(round(overall_table, 4),
+          file.path(out_dir, "overall_quantiles_Orebro.csv"))
+
+# histograms with P5, P50, P95
+draw_prob_hist <- function(values, title) {
+  q <- quantile(values, c(0.05, 0.50, 0.95))
+  hist(values, breaks = 40, col = "grey80", border = "white",
+       main = title, xlab = "p(inf | forest, Orebro) (%)")
+  abline(v = q[c(1, 3)], col = "red", lty = 2, lwd = 2)
+  abline(v = q[2],       col = "black", lwd = 2)
+  legend("topleft", bty = "n",
+         legend = c(paste0("P5 = ",  round(q[1], 3), " %"),
+                    paste0("P50 = ", round(q[2], 3), " %"),
+                    paste0("P95 = ", round(q[3], 3), " %")),
+         col = c("red", "black", "red"), lty = c(2, 1, 2), lwd = 2)
+}
+
+draw_prob_hist(p_inf_maxnet, "Maxnet bootstrap x prevalence")
+png(file.path(out_dir, "04_probability_histogram_maxnet_Orebro.png"),
+    width = 7, height = 5, units = "in", res = 250)
+draw_prob_hist(p_inf_maxnet, "Maxnet bootstrap x prevalence")
+invisible(dev.off())
+
+draw_prob_hist(p_inf_cell, "Cell bootstrap x prevalence")
+png(file.path(out_dir, "04b_probability_histogram_cell_Orebro.png"),
+    width = 7, height = 5, units = "in", res = 250)
+draw_prob_hist(p_inf_cell, "Cell bootstrap x prevalence")
+invisible(dev.off())
+```
